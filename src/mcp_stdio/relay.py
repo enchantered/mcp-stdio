@@ -4004,7 +4004,7 @@ def _post_and_stream(
     capture_init: bool = False,
     has_id: bool = True,
     input_required_hook: Callable[[str], str | None] | None = None,
-    input_required_abort: Callable[[str], None] | None = None,
+    input_required_abort: Callable[[str], bool] | None = None,
     abort: "threading.Event | None" = None,
     publish_response: Callable[["httpx.Response | None"], None] | None = None,
     capture_error: bool = False,
@@ -4029,8 +4029,9 @@ def _post_and_stream(
 
     ``has_id`` mirrors the run() loop's notification policy one frame
     deeper: a notification (no JSON-RPC id) must never receive a
-    synthesized error response, so the retry-exhausted / stream-interrupted
-    error writes below are suppressed when ``has_id`` is False (the failure
+    synthesized error response, so the retry-exhausted / stream-interrupted /
+    unanswered-stream (#475) error writes below are suppressed when ``has_id``
+    is False (the failure
     is still logged to stderr), matching the ``req_has_id`` gating in run().
 
     ``input_required_hook`` is the MRTR interception point (#270 Phase 2 PR
@@ -4066,7 +4067,8 @@ def _post_and_stream(
     original body while a transaction it opened is still alive.
 
     ``input_required_abort`` (#356 review R1F1) is the failure counterpart,
-    passed by exactly the same two call sites and never alone. When the
+    passed by exactly the same two call sites and never alone. It returns
+    whether it answered: ``False`` when no transaction is live. When the
     stream breaks AFTER a swallow, writing the ordinary
     "upstream stream interrupted" error under ``req_id`` would answer the
     client while the transaction stays alive and its minted requests stay on
@@ -4076,12 +4078,15 @@ def _post_and_stream(
     callback is invoked INSTEAD of the generic write; it funnels through
     ``_mrtr_abort``, which purges the transaction, cancels the outstanding
     minted requests downstream and writes exactly one error under the
-    client's id. (Only the SWALLOWED case is special. A retry whose re-keyed
-    final result was already emitted and is then interrupted still gets a
-    result plus an interrupted error under one id — that is the generic
-    partial-delivery behavior of this function on both eras, unchanged by
-    and pre-dating the bridge; ``_mrtr_run_retry`` merely purges afterwards
-    so no THIRD response follows.)
+    client's id. Every other "this id is owed one error" outcome — an empty
+    reply, a stream that ended without the response (#475), an interruption
+    after a non-response payload — goes through the same ``_owe_error``
+    helper: the funnel first, and the plain write only when the funnel did
+    not answer and nothing was swallowed. Once the request's own response
+    (re-keyed or not) has been emitted, nothing more is written for its id:
+    a later interruption is ignored and a repeated response is dropped
+    (#475; this replaced the older "result plus an interrupted error under
+    one id" outcome).
 
     A non-compliant server can also make a payload LOOK swallowed when
     nothing is actually pending: a duplicate of an already-emitted terminal
@@ -4164,6 +4169,39 @@ def _post_and_stream(
         # written), so both the empty-response synthesis and the
         # mid-stream replay must treat it exactly like a partial delivery.
         swallowed = False
+
+        def _owe_error(reason: str, swallowed: bool) -> None:
+            """Write the one error a request with an id is still owed (#475).
+
+            A live MRTR transaction answers through its own funnel; when it
+            does not (no transaction), the error is written here unless a
+            swallowed payload means the hook already answered, or the client
+            has cancelled the id (the non-consuming tracker check REVIEW.md
+            §3 asks of every synthesized response, as in #444's path).
+            """
+            if input_required_abort is not None and input_required_abort(reason):
+                return
+            if swallowed:
+                return
+            if tracker is not None and tracker.contains(req_id):
+                return
+            _write_line(_error_response(reason, req_id))
+
+        # Whether the request's own JSON-RPC response has reached stdout on
+        # this attempt (#475). ``emitted`` alone is not enough: a server may
+        # send notifications (progress, logging) on a request-scoped SSE
+        # stream before the response, and a stream that then ends without
+        # it must not pass for an answered request. The check runs on what
+        # reached stdout, i.e. after an MRTR hook rewrote the payload to the
+        # client's id. A request with a null id cannot be matched (a pure
+        # response needs a non-null id), so it is not tracked.
+        # Deliberately NOT era-gated, like #444 and #416: both outcomes it
+        # changes (an id left unanswered forever, and two answers for one id)
+        # are JSON-RPC violations to fix, not legacy wire behavior to freeze.
+        # A server that answers its requests over a stream that stays intact
+        # sees no difference.
+        answered = False
+        tracked = has_id and req_id is not None
         try:
             with client.stream("POST", url, content=content, headers=headers) as resp:
                 if publish_response is not None:
@@ -4268,8 +4306,21 @@ def _post_and_stream(
                                 swallowed = True
                                 continue
                             payload = replacement
+                        if answered and _is_pure_response_for(payload, req_id):
+                            # A misbehaving server repeated the response: one
+                            # answer per id. Reading continues, so frames that
+                            # follow (e.g. list_changed) still arrive and the
+                            # connection can return to the pool.
+                            log(f"request {req_id!r}: repeated response dropped")
+                            continue
                         _emit(payload, tracker)
                         emitted = True
+                        if (
+                            tracked
+                            and not answered
+                            and _is_pure_response_for(payload, req_id)
+                        ):
+                            answered = True
                 else:
                     _read_bounded(resp, client)
                     text = resp.text.strip()
@@ -4291,6 +4342,10 @@ def _post_and_stream(
                         if text:
                             _emit(text, tracker)
                             emitted = True
+                            # A single JSON body is the whole reply, passed
+                            # through as-is even when malformed; only the SSE
+                            # branch can carry notifications ahead of it.
+                            answered = True
 
                 if _abort_requested(abort):
                     # Required changes 2 and 4, the FALSE-NORMAL arm. A
@@ -4311,7 +4366,18 @@ def _post_and_stream(
                     # waiting forever. Synthesize an error so the client is not
                     # left hanging, mirroring the >=400 fall-through in run().
                     # Notifications (has_id False) stay silent.
-                    _write_line(_error_response("empty response from server", req_id))
+                    _owe_error("empty response from server", False)
+                elif emitted and tracked and not answered and not swallowed:
+                    # #475: the stream delivered only notifications and ended
+                    # without the response. Same reasoning as above: without
+                    # this the client waits forever for an id nobody answers.
+                    # Worded like #444: the server may have run the request.
+                    log(f"request {req_id!r}: stream ended without a response")
+                    _owe_error(
+                        "upstream stream ended without a response; "
+                        "the request may have executed",
+                        False,
+                    )
                 # pv is intentionally None here: no InitializeResult was
                 # delivered, so an empty-200 to an `initialize` request leaves
                 # the relay's protocol_version unset rather than guessing a
@@ -4346,6 +4412,13 @@ def _post_and_stream(
                 # funnel — required changes 4 and 10.
                 log(f"request {req_id!r} cancelled by the client: {e}")
                 return _aborted_result()
+            if answered:
+                # #475: the response already reached the client; a read
+                # failure after it (a trailing frame, the close) must not
+                # produce a second answer for the same id, nor count as a
+                # failed attempt.
+                log(f"request {req_id!r}: transport error after the response; ignored")
+                return _StreamResult(session, 200, protocol_version=pv)
             last_error = e
             log(f"attempt {attempt}/{MAX_RETRIES} failed: {e}")
             if emitted or swallowed:
@@ -4356,23 +4429,20 @@ def _post_and_stream(
                 # requests on the client's stdin and the server-side work may
                 # already have run, so a replay would duplicate both.
                 log("upstream stream interrupted after partial delivery; not retrying")
-                if swallowed and input_required_abort is not None:
-                    # #356 review R1F1: the swallowed payload opened (or
-                    # extended) an MRTR transaction that is STILL alive, with
-                    # minted requests already on the client's stdin. A plain
-                    # error under req_id would answer the client now and the
-                    # completed retry would answer it again later. Route
-                    # through the transaction's own abort funnel instead —
-                    # exactly one error under this id, plus the downstream
-                    # cancels that retire the dialogs nobody will collect.
-                    # The callback is a no-op when the hook ALREADY aborted
-                    # (an unbridgeable round answers and purges from inside
-                    # the swallow), so this path can never write twice.
-                    input_required_abort(f"upstream stream interrupted: {e}")
-                elif has_id:
-                    _write_line(
-                        _error_response(f"upstream stream interrupted: {e}", req_id)
-                    )
+                if has_id:
+                    # #356 review R1F1: when an MRTR transaction is STILL
+                    # alive (minted requests already on the client's stdin), a
+                    # plain error under req_id would answer the client now and
+                    # the completed retry would answer it again later, so
+                    # ``_owe_error`` routes through the transaction's own abort
+                    # funnel first — exactly one error under this id, plus the
+                    # downstream cancels that retire the dialogs nobody will
+                    # collect. When the funnel finds no live transaction after
+                    # a swallow, the hook ALREADY answered (an unbridgeable
+                    # round answers and purges from inside the swallow), so
+                    # nothing more is written; without a swallow the plain
+                    # error is written.
+                    _owe_error(f"upstream stream interrupted: {e}", swallowed)
                 # Return a 200 result carrying any captured protocol_version instead of None: the InitializeResult was already
                 # delivered, so the client considers init complete. Returning None
                 # would discard the negotiated version, leaving the relay's
@@ -9239,7 +9309,7 @@ def run(
 
         return hook
 
-    def _make_input_required_abort(client_id: Any) -> Callable[[str], None]:
+    def _make_input_required_abort(client_id: Any) -> Callable[[str], bool]:
         """Build the failure counterpart of the interception hook (R1F1).
 
         Handed to ``_post_and_stream`` alongside every hook and invoked on
@@ -9266,16 +9336,22 @@ def run(
         server, and the same code already covers the other "the exchange
         could not be completed" outcomes (cap breaches, a client error on a
         minted id).
+
+        Returns whether it answered: ``False`` when no transaction is live,
+        which is also the case for an initial request whose stream ended
+        before any round opened (#475). The caller then owes the client
+        the error itself.
         """
 
-        def abort(reason: str) -> None:
+        def abort(reason: str) -> bool:
             if client_id not in mrtr_txns:
                 log(
-                    f"MRTR POST for id {client_id!r} failed after the "
-                    f"transaction was already answered: {reason}"
+                    f"MRTR POST for id {client_id!r} failed with no live "
+                    f"transaction: {reason}"
                 )
-                return
+                return False
             _mrtr_abort(client_id, reason, code=-32000)
+            return True
 
         return abort
 

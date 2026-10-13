@@ -488,6 +488,263 @@ class TestPostAndStream:
         assert result is not None
         assert result.status_code == 200
 
+    # --- #475: notifications before the response on a request-scoped SSE reply ---
+
+    _PROGRESS = (
+        '{"jsonrpc":"2.0","method":"notifications/progress",'
+        '"params":{"progressToken":"t","progress":1}}'
+    )
+
+    @staticmethod
+    def _stdout_lines(capsys) -> list[dict]:
+        return [json.loads(x) for x in capsys.readouterr().out.splitlines() if x]
+
+    def test_notification_only_stream_gets_one_error(self, httpx_mock, capsys):
+        """A stream that carries only notifications and then ends must not
+        pass for an answered request: the client gets the notification and
+        then exactly one error under its id, instead of waiting forever."""
+        httpx_mock.add_response(
+            stream=IteratorStream([f"data: {self._PROGRESS}\n\n".encode()]),
+            headers={"content-type": "text/event-stream"},
+        )
+        result = _post_and_stream(
+            httpx.Client(), "https://example.com/mcp", '{"id":1}', {}, 1
+        )
+        assert result is not None
+        lines = self._stdout_lines(capsys)
+        assert [m.get("method") for m in lines] == ["notifications/progress", None]
+        assert lines[1]["id"] == 1
+        assert "ended without a response" in lines[1]["error"]["message"]
+
+    def test_notification_then_response_is_answered(self, httpx_mock, capsys):
+        response = '{"jsonrpc":"2.0","id":1,"result":{}}'
+        httpx_mock.add_response(
+            stream=IteratorStream(
+                [
+                    f"data: {self._PROGRESS}\n\n".encode(),
+                    f"data: {response}\n\n".encode(),
+                ]
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+        result = _post_and_stream(
+            httpx.Client(), "https://example.com/mcp", '{"id":1}', {}, 1
+        )
+        assert result is not None and result.status_code == 200
+        lines = self._stdout_lines(capsys)
+        assert len(lines) == 2
+        assert lines[1] == {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+    def test_response_for_another_id_does_not_answer(self, httpx_mock, capsys):
+        """Only a response carrying the request's own id counts."""
+        other = '{"jsonrpc":"2.0","id":2,"result":{}}'
+        httpx_mock.add_response(
+            stream=IteratorStream([f"data: {other}\n\n".encode()]),
+            headers={"content-type": "text/event-stream"},
+        )
+        _post_and_stream(httpx.Client(), "https://example.com/mcp", '{"id":1}', {}, 1)
+        lines = self._stdout_lines(capsys)
+        assert lines[-1]["id"] == 1 and "error" in lines[-1]
+
+    def test_read_error_after_the_response_adds_nothing(self, httpx_mock, capsys):
+        """Once the response reached the client, a read failure after it
+        (a trailing frame, the close) must not put a second answer on the
+        wire for the same id, nor trigger a retry."""
+        response = '{"jsonrpc":"2.0","id":1,"result":{}}'
+
+        def gen():
+            yield f"data: {response}\n\n".encode()
+            raise httpx.ReadError("connection dropped after the response")
+
+        httpx_mock.add_response(
+            stream=IteratorStream(gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+        with patch("mcp_stdio.relay.time.sleep") as sleep:
+            result = _post_and_stream(
+                httpx.Client(), "https://example.com/mcp", '{"id":1}', {}, 1
+            )
+        assert result is not None and result.status_code == 200
+        sleep.assert_not_called()
+        assert self._stdout_lines(capsys) == [{"jsonrpc": "2.0", "id": 1, "result": {}}]
+
+    def test_tools_list_hook_does_not_disable_tracking(self, httpx_mock, capsys):
+        """A pass-through hook without ``input_required_abort`` (the
+        tools/list header hook) never takes over the answer, so the request
+        is still tracked: a notification-only stream gets its error."""
+        httpx_mock.add_response(
+            stream=IteratorStream([f"data: {self._PROGRESS}\n\n".encode()]),
+            headers={"content-type": "text/event-stream"},
+        )
+        _post_and_stream(
+            httpx.Client(),
+            "https://example.com/mcp",
+            '{"id":1}',
+            {},
+            1,
+            input_required_hook=lambda payload: payload,
+        )
+        lines = self._stdout_lines(capsys)
+        assert lines[-1]["id"] == 1 and "error" in lines[-1]
+
+    def test_mrtr_hook_routes_the_error_through_its_abort(self, httpx_mock, capsys):
+        """Under an MRTR hook (modern tools/call) the request is still
+        tracked, and the one error goes through ``input_required_abort`` so a
+        live transaction is retired instead of being answered beside it."""
+        httpx_mock.add_response(
+            stream=IteratorStream([f"data: {self._PROGRESS}\n\n".encode()]),
+            headers={"content-type": "text/event-stream"},
+        )
+        aborts: list[str] = []
+
+        def abort(reason: str) -> bool:
+            aborts.append(reason)
+            return True  # a live transaction answered
+
+        _post_and_stream(
+            httpx.Client(),
+            "https://example.com/mcp",
+            '{"id":1}',
+            {},
+            1,
+            input_required_hook=lambda payload: payload,
+            input_required_abort=abort,
+        )
+        assert len(aborts) == 1 and "ended without a response" in aborts[0]
+        lines = self._stdout_lines(capsys)
+        assert [m.get("method") for m in lines] == ["notifications/progress"]
+
+    def test_mrtr_hook_without_a_live_transaction_errors_directly(
+        self, httpx_mock, capsys
+    ):
+        """An MRTR-eligible request whose stream ends before any round
+        opened has no transaction to answer for it: the funnel declines
+        (returns False) and the relay writes the one error itself."""
+        httpx_mock.add_response(
+            stream=IteratorStream([f"data: {self._PROGRESS}\n\n".encode()]),
+            headers={"content-type": "text/event-stream"},
+        )
+        _post_and_stream(
+            httpx.Client(),
+            "https://example.com/mcp",
+            '{"id":1}',
+            {},
+            1,
+            input_required_hook=lambda payload: payload,
+            input_required_abort=lambda reason: False,
+        )
+        lines = self._stdout_lines(capsys)
+        assert [m.get("method") for m in lines] == ["notifications/progress", None]
+        assert (
+            lines[1]["id"] == 1
+            and "ended without a response" in lines[1]["error"]["message"]
+        )
+
+    def test_frames_after_the_response_still_arrive(self, httpx_mock, capsys):
+        """Reading continues past the response: a notification that follows
+        it (e.g. tools/list_changed) still reaches the client, and a repeated
+        response is dropped."""
+        response = '{"jsonrpc":"2.0","id":1,"result":{}}'
+        changed = '{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}'
+        httpx_mock.add_response(
+            stream=IteratorStream(
+                [
+                    f"data: {response}\n\n".encode(),
+                    f"data: {response}\n\n".encode(),
+                    f"data: {changed}\n\n".encode(),
+                ]
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+        seen: list[str] = []
+        _post_and_stream(
+            httpx.Client(),
+            "https://example.com/mcp",
+            '{"id":1}',
+            {},
+            1,
+            observe=seen.append,
+        )
+        lines = self._stdout_lines(capsys)
+        assert lines == [
+            {"jsonrpc": "2.0", "id": 1, "result": {}},
+            {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"},
+        ]
+        assert any("list_changed" in p for p in seen)
+
+    def test_cancelled_id_gets_no_synthesized_error(self, httpx_mock, capsys):
+        """REVIEW.md §3: no synthesized error under an id the client has
+        cancelled (non-consuming tracker check)."""
+        httpx_mock.add_response(
+            stream=IteratorStream([f"data: {self._PROGRESS}\n\n".encode()]),
+            headers={"content-type": "text/event-stream"},
+        )
+        tracker = _CancelTracker()
+        tracker.add(1)
+        _post_and_stream(
+            httpx.Client(), "https://example.com/mcp", '{"id":1}', {}, 1, tracker
+        )
+        lines = self._stdout_lines(capsys)
+        assert [m.get("method") for m in lines] == ["notifications/progress"]
+
+    def test_null_id_is_not_tracked(self, httpx_mock, capsys):
+        """A null id cannot be matched to a response, so nothing is added
+        after the server's own answer under id null."""
+        answer = '{"jsonrpc":"2.0","id":null,"error":{"code":-32600,"message":"x"}}'
+        httpx_mock.add_response(
+            stream=IteratorStream([f"data: {answer}\n\n".encode()]),
+            headers={"content-type": "text/event-stream"},
+        )
+        _post_and_stream(
+            httpx.Client(), "https://example.com/mcp", '{"id":null}', {}, None
+        )
+        lines = self._stdout_lines(capsys)
+        assert len(lines) == 1 and lines[0]["error"]["message"] == "x"
+
+    def test_escaped_id_key_still_counts_as_the_response(self, httpx_mock, capsys):
+        """A JSON key may be escaped; recognition parses the payload rather
+        than looking for a literal ``"id"``, so no second answer follows."""
+        response = '{"jsonrpc":"2.0","\\u0069d":1,"result":{}}'
+        httpx_mock.add_response(
+            stream=IteratorStream([f"data: {response}\n\n".encode()]),
+            headers={"content-type": "text/event-stream"},
+        )
+        _post_and_stream(httpx.Client(), "https://example.com/mcp", '{"id":1}', {}, 1)
+        assert self._stdout_lines(capsys) == [{"jsonrpc": "2.0", "id": 1, "result": {}}]
+
+    def test_a_repeated_response_is_not_forwarded(self, httpx_mock, capsys):
+        """Only one answer per id: a repeated response is dropped while the
+        stream is still read to its end."""
+        response = '{"jsonrpc":"2.0","id":1,"result":{}}'
+        httpx_mock.add_response(
+            stream=IteratorStream(
+                [
+                    f"data: {response}\n\n".encode(),
+                    f"data: {response}\n\n".encode(),
+                ]
+            ),
+            headers={"content-type": "text/event-stream"},
+        )
+        _post_and_stream(httpx.Client(), "https://example.com/mcp", '{"id":1}', {}, 1)
+        assert self._stdout_lines(capsys) == [{"jsonrpc": "2.0", "id": 1, "result": {}}]
+
+    def test_notification_on_a_notification_post_stays_silent(self, httpx_mock, capsys):
+        """has_id False: nothing is ever synthesized for a notification."""
+        httpx_mock.add_response(
+            stream=IteratorStream([f"data: {self._PROGRESS}\n\n".encode()]),
+            headers={"content-type": "text/event-stream"},
+        )
+        _post_and_stream(
+            httpx.Client(),
+            "https://example.com/mcp",
+            '{"method":"notifications/x"}',
+            {},
+            None,
+            has_id=False,
+        )
+        lines = self._stdout_lines(capsys)
+        assert [m.get("method") for m in lines] == ["notifications/progress"]
+
     def test_returns_none_after_max_retries(self, httpx_mock):
         for _ in range(3):
             httpx_mock.add_exception(httpx.ConnectError("refused"))
@@ -662,7 +919,14 @@ class TestPostAndStream:
         stdout = StringIO()
         with patch("sys.stdout", stdout):
             _post_and_stream(client, "https://example.com/mcp", '{"id":1}', {}, 1)
-        assert stdout.getvalue().strip() == "a\nb\nc"
+        out = stdout.getvalue()
+        assert out.startswith("a\nb\nc\n")
+        # #475: the joined payload is not a response for id 1, so the stream
+        # ends unanswered and exactly one error follows it.
+        tail = json.loads(out[len("a\nb\nc\n") :])
+        assert (
+            tail["id"] == 1 and "ended without a response" in tail["error"]["message"]
+        )
 
     def test_sse_payload_with_raw_unicode_separators_not_corrupted(self, httpx_mock):
         """A spec-compliant server SSE-framing a JSON-RPC response whose string
@@ -690,9 +954,12 @@ class TestPostAndStream:
         assert json.loads(out)["result"]["text"] == f"a{seps}b"
 
     def test_midstream_failure_does_not_retry_or_duplicate(self, httpx_mock):
-        """A transient error AFTER a payload was delivered must not replay the
-        non-idempotent POST (which would duplicate the response). Instead a
-        single stream-interrupted error is emitted and no second POST runs."""
+        """A transient error AFTER the response was delivered must not replay
+        the non-idempotent POST (which would duplicate the response), and since
+        #475 it must not append an error either: the id is already answered,
+        and a second answer for it is the two-responses-one-id hazard. The
+        partial-delivery case (a payload that is not the response) still gets
+        its single stream-interrupted error, see the next test."""
         delivered = '{"jsonrpc":"2.0","result":{},"id":1}'
 
         def gen():
@@ -716,11 +983,34 @@ class TestPostAndStream:
         # delivered, so its negotiated state must not be discarded.
         assert result is not None and result.status_code == 200
         lines = [json.loads(x) for x in stdout.getvalue().strip().splitlines() if x]
-        # The already-delivered payload, then exactly one synthesized error
-        # for the same request id — never a duplicate of the payload.
-        assert lines[0]["result"] == {}
-        assert lines[1]["error"]["message"].startswith("upstream stream interrupted")
+        # The already-delivered response and nothing else.
+        assert lines == [{"jsonrpc": "2.0", "result": {}, "id": 1}]
+
+    def test_midstream_failure_after_a_notification_errors_once(self, httpx_mock):
+        """The partial-delivery case #475 leaves in place: a notification
+        reached the client, then the stream broke before the response. No
+        replay, and exactly one stream-interrupted error under the id."""
+        note = '{"jsonrpc":"2.0","method":"notifications/message","params":{}}'
+
+        def gen():
+            yield f"event: message\ndata: {note}\n\n".encode()
+            raise httpx.ReadError("connection dropped mid-stream")
+
+        httpx_mock.add_response(
+            stream=IteratorStream(gen()),
+            headers={"content-type": "text/event-stream"},
+        )
+        stdout = StringIO()
+        with patch("sys.stdout", stdout), patch("mcp_stdio.relay.time.sleep"):
+            result = _post_and_stream(
+                httpx.Client(), "https://example.com/mcp", '{"id":1}', {}, 1
+            )
+        assert len(httpx_mock.get_requests()) == 1
+        assert result is not None and result.status_code == 200
+        lines = [json.loads(x) for x in stdout.getvalue().strip().splitlines() if x]
+        assert lines[0]["method"] == "notifications/message"
         assert lines[1]["id"] == 1
+        assert lines[1]["error"]["message"].startswith("upstream stream interrupted")
         assert len(lines) == 2
 
     def test_preoutput_failure_still_retries(self, httpx_mock):
@@ -15836,6 +16126,37 @@ class TestRunModernMrtrBridge:
         assert len(lines) == 2
         assert lines[1]["method"] == "elicitation/create"
         assert not [line for line in lines if "error" in line]
+
+    def test_progress_only_stream_before_any_round_gets_one_error(self, httpx_mock):
+        """#475 end to end: an MRTR-eligible tools/call whose stream carries
+        only progress and ends, before any round opened. The real abort
+        callback has no transaction to answer for, so the relay must write
+        the one error itself rather than leave id 2 waiting forever."""
+        self._register_listen_stream(httpx_mock)
+        self._register_discover(httpx_mock)
+        progress = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/progress",
+                "params": {"progressToken": "t", "progress": 1},
+            }
+        )
+        httpx_mock.add_response(
+            url=self.URL,
+            match_headers={"Mcp-Method": "tools/call"},
+            stream=IteratorStream([f"event: message\ndata: {progress}\n\n".encode()]),
+            headers={"content-type": "text/event-stream"},
+        )
+        output = self._run_with_stdin(
+            httpx_mock,
+            [self._initialize({"elicitation": {}}), self._call()],
+            protocol_era="modern",
+        )
+        lines = self._out(output)
+        answers = [line for line in lines if line.get("id") == 2]
+        assert len(answers) == 1
+        assert "ended without a response" in answers[0]["error"]["message"]
+        assert any(line.get("method") == "notifications/progress" for line in lines)
 
     def test_interrupt_after_a_swallowed_round_aborts_once(self, httpx_mock):
         """#356 review R1F1. The stream carrying the `input_required` breaks

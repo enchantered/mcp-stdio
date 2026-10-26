@@ -6397,21 +6397,39 @@ class TestCheckConnectionSse:
         assert str(posts[0].url) == "https://example.com/messages?sid=xyz"
         assert b'"method":"initialize"' in posts[0].read().replace(b" ", b"")
 
-    def test_sse_reports_server_info(self, httpx_mock, capsys):
-        """serverInfo / capabilities from the streamed response reach the log."""
+    def _add_gated_sse_handshake(self, httpx_mock, chunks, post_url, gate_index):
+        """Hold one GET-stream event until the helper-thread POST is observed."""
+        post_attempted = threading.Event()
+
+        def sse_gen():
+            for index, chunk in enumerate(chunks):
+                if index == gate_index and not post_attempted.wait(timeout=10):
+                    return
+                yield chunk
+
         httpx_mock.add_response(
             url=self.SSE_URL,
             method="GET",
-            stream=IteratorStream(
-                [
-                    b"event: endpoint\ndata: /messages\n\n",
-                    f"event: message\ndata: {self._INIT_RESULT}\n\n".encode(),
-                ]
-            ),
+            stream=IteratorStream(sse_gen()),
             headers={"content-type": "text/event-stream"},
         )
-        httpx_mock.add_response(
-            url="https://example.com/messages", method="POST", status_code=202
+
+        def on_post(request: httpx.Request) -> httpx.Response:
+            post_attempted.set()
+            return httpx.Response(status_code=202)
+
+        httpx_mock.add_callback(on_post, url=post_url, method="POST")
+
+    def test_sse_reports_server_info(self, httpx_mock, capsys):
+        """serverInfo / capabilities from the streamed response reach the log."""
+        self._add_gated_sse_handshake(
+            httpx_mock,
+            [
+                b"event: endpoint\ndata: /messages\n\n",
+                f"event: message\ndata: {self._INIT_RESULT}\n\n".encode(),
+            ],
+            "https://example.com/messages",
+            gate_index=1,
         )
         assert (
             check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse") is True
@@ -6424,20 +6442,15 @@ class TestCheckConnectionSse:
         """: a non-JSON message arriving AFTER the endpoint event must
         be skipped (the json.JSONDecodeError continue) and the probe keeps reading
         until the real initialize result — still returns True."""
-        httpx_mock.add_response(
-            url=self.SSE_URL,
-            method="GET",
-            stream=IteratorStream(
-                [
-                    b"event: endpoint\ndata: /messages\n\n",
-                    b"event: message\ndata: not-json-at-all\n\n",
-                    f"event: message\ndata: {self._INIT_RESULT}\n\n".encode(),
-                ]
-            ),
-            headers={"content-type": "text/event-stream"},
-        )
-        httpx_mock.add_response(
-            url="https://example.com/messages", method="POST", status_code=202
+        self._add_gated_sse_handshake(
+            httpx_mock,
+            [
+                b"event: endpoint\ndata: /messages\n\n",
+                b"event: message\ndata: not-json-at-all\n\n",
+                f"event: message\ndata: {self._INIT_RESULT}\n\n".encode(),
+            ],
+            "https://example.com/messages",
+            gate_index=2,
         )
         assert (
             check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse") is True
@@ -6475,19 +6488,14 @@ class TestCheckConnectionSse:
     def test_sse_mcp_error_returns_false(self, httpx_mock):
         """A JSON-RPC error delivered on the stream → False."""
         err_body = '{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"boom"}}'
-        httpx_mock.add_response(
-            url=self.SSE_URL,
-            method="GET",
-            stream=IteratorStream(
-                [
-                    b"event: endpoint\ndata: /messages\n\n",
-                    f"event: message\ndata: {err_body}\n\n".encode(),
-                ]
-            ),
-            headers={"content-type": "text/event-stream"},
-        )
-        httpx_mock.add_response(
-            url="https://example.com/messages", method="POST", status_code=202
+        self._add_gated_sse_handshake(
+            httpx_mock,
+            [
+                b"event: endpoint\ndata: /messages\n\n",
+                f"event: message\ndata: {err_body}\n\n".encode(),
+            ],
+            "https://example.com/messages",
+            gate_index=1,
         )
         assert (
             check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse") is False
@@ -6649,20 +6657,15 @@ class TestCheckConnectionSse:
         be ignored (no POST can target an unknown endpoint yet); the probe POSTs
         only after the endpoint and still completes on the real result."""
         early = '{"jsonrpc":"2.0","method":"notifications/message","params":{}}'
-        httpx_mock.add_response(
-            url=self.SSE_URL,
-            method="GET",
-            stream=IteratorStream(
-                [
-                    f"event: message\ndata: {early}\n\n".encode(),  # before endpoint
-                    b"event: endpoint\ndata: /messages\n\n",
-                    f"event: message\ndata: {self._INIT_RESULT}\n\n".encode(),
-                ]
-            ),
-            headers={"content-type": "text/event-stream"},
-        )
-        httpx_mock.add_response(
-            url="https://example.com/messages", method="POST", status_code=202
+        self._add_gated_sse_handshake(
+            httpx_mock,
+            [
+                f"event: message\ndata: {early}\n\n".encode(),  # before endpoint
+                b"event: endpoint\ndata: /messages\n\n",
+                f"event: message\ndata: {self._INIT_RESULT}\n\n".encode(),
+            ],
+            "https://example.com/messages",
+            gate_index=2,
         )
         assert (
             check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse") is True
@@ -6680,14 +6683,11 @@ class TestCheckConnectionSse:
         endpoint_event = b"event: endpoint\ndata: /messages\n\n"
         init_event = f"event: message\ndata: {self._INIT_RESULT}\n\n".encode()
         assert len(endpoint_event) < 40 < len(endpoint_event) + len(init_event)
-        httpx_mock.add_response(
-            url=self.SSE_URL,
-            method="GET",
-            stream=IteratorStream([endpoint_event, init_event]),
-            headers={"content-type": "text/event-stream"},
-        )
-        httpx_mock.add_response(
-            url="https://example.com/messages", method="POST", status_code=202
+        self._add_gated_sse_handshake(
+            httpx_mock,
+            [endpoint_event, init_event],
+            "https://example.com/messages",
+            gate_index=1,
         )
         assert (
             check_connection(
@@ -6702,19 +6702,14 @@ class TestCheckConnectionSse:
     def test_check_sse_sends_accept_encoding_identity(self, httpx_mock):
         """#417 review R1F2: the SSE handshake's GET stream also asks the
         server not to compress."""
-        httpx_mock.add_response(
-            url=self.SSE_URL,
-            method="GET",
-            stream=IteratorStream(
-                [
-                    b"event: endpoint\ndata: /messages\n\n",
-                    f"event: message\ndata: {self._INIT_RESULT}\n\n".encode(),
-                ]
-            ),
-            headers={"content-type": "text/event-stream"},
-        )
-        httpx_mock.add_response(
-            url="https://example.com/messages", method="POST", status_code=202
+        self._add_gated_sse_handshake(
+            httpx_mock,
+            [
+                b"event: endpoint\ndata: /messages\n\n",
+                f"event: message\ndata: {self._INIT_RESULT}\n\n".encode(),
+            ],
+            "https://example.com/messages",
+            gate_index=1,
         )
         check_connection(self.SSE_URL, dict(self.HEADERS), transport="sse")
         gets = [r for r in httpx_mock.get_requests() if r.method == "GET"]
